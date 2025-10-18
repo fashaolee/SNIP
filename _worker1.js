@@ -8,7 +8,7 @@ let proxyIP = ''; // 如需使用代理请写成 host:port 形式
 const preferredDomains = [
     'store.ubi.com',
     'ip.sb',
-    'icook.tw',
+    'mfa.gov.ua',
     'shopify.com',
     'cloudflare-dl.byoip.top',
     'staticdelivery.nexusmods.com',
