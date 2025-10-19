@@ -1,15 +1,15 @@
 import { connect } from 'cloudflare:sockets';
 
 // ==================== ① 基础配置 ====================
-let userID = '';          // ← 请自行替换为你的 UUID
-let proxyIP = '';                 // 默认后备代理（无端口时使用目标端口）
+let userID = ''; // 请替换成你的 UUID
+const DEFAULT_PROXY_STR = ''; // 默认 proxyip（回退使用）
 
-// 订阅中返回的节点名称改为 “T‑SNIP‑序号” 形式
+// 节点别名：T-SNIP-01、T-SNIP-02 ...
 function nodeAlias(idx) {
   return `T-SNIP-${String(idx + 1).padStart(2, '0')}`;
 }
 
-// 需要在订阅中展示的域名列表
+// 订阅展示域名列表
 const preferredDomains = [
   'store.ubi.com',
   'ip.sb',
@@ -24,22 +24,21 @@ const preferredDomains = [
   'saas.sin.fan',
 ];
 
-// ==================== ② 代理信息解析（纯函数） ====================
-let proxyConfig = { proxyHost: '', proxyPort: null };
-function parseProxyIP(input) {
-  proxyConfig = { proxyHost: '', proxyPort: null };
-  if (!input) return;
-  const parts = input.split(':');
-  proxyConfig.proxyHost = parts[0].trim();
+// ==================== ② 工具函数 ====================
+function parseProxyStr(input) {
+  if (!input) return { proxyHost: '', proxyPort: null };
+  const parts = String(input).trim().split(':');
+  const host = (parts[0] || '').trim();
+  let port = null;
   if (parts.length > 1) {
     const p = parseInt(parts[1].trim(), 10);
-    if (!isNaN(p) && p > 0 && p <= 65535) proxyConfig.proxyPort = p;
+    if (!isNaN(p) && p > 0 && p <= 65535) port = p;
   }
+  return { proxyHost: host, proxyPort: port };
 }
-parseProxyIP(proxyIP);
+const defaultProxyConfig = parseProxyStr(DEFAULT_PROXY_STR);
 
-// ==================== ③ 工具函数 ====================
-// 合并任意数量的 Uint8Array / ArrayBuffer 为单一 ArrayBuffer（比 Blob 更轻量）
+// 合并 ArrayBuffer/Uint8Array
 function concatArrayBuffers(...arrays) {
   const total = arrays.reduce((sum, a) => sum + a.byteLength, 0);
   const tmp = new Uint8Array(total);
@@ -51,7 +50,6 @@ function concatArrayBuffers(...arrays) {
   return tmp.buffer;
 }
 
-// base8Array（用于 early‑data）
 function base64ToArrayBuffer(str) {
   if (!str) return { error: null };
   try {
@@ -64,7 +62,13 @@ function base64ToArrayBuffer(str) {
   }
 }
 
-// UUID 检验 & 字符串化
+function extractProxyFromPath(pathname) {
+  // 支持 /proxyip=host 或 /proxyip=host:port
+  const m = /^\/proxyip=([^/]+)/i.exec(pathname);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+// UUID 校验
 function isValidUUID(uuid) {
   const re = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   return re.test(uuid);
@@ -87,10 +91,10 @@ function stringify(arr, off = 0) {
   return uuid;
 }
 
-// ==================== ④ VLESS 订阅生成（去掉 ed 参数） ====================
-function getVLESSConfig(uuid, host) {
+// ==================== ③ 订阅生成（path 带 /proxyip=...） ====================
+function getVLESSConfig(uuid, host, selectedProxyStr) {
   const protocol = 'vless';
-  const path = '/'; // 不再带 ed 参数
+  const path = `/proxyip=${selectedProxyStr}`; // 路径直观显示当前 proxyip
   const params = new URLSearchParams({
     encryption: 'none',
     security: 'tls',
@@ -106,56 +110,56 @@ function getVLESSConfig(uuid, host) {
   });
 
   const txt = uris.join('\n');
-  // URL‑Safe Base64（直接可用于 Clash / V2Ray 订阅）
+  // URL-safe Base64
   return btoa(txt).replace(/\+/g, '-').replace(/\//g, '_');
 }
 
-// ==================== ⑤ 主入口 ====================
-if (!isValidUUID(userID)) {
-  throw new Error('uuid is not valid');
-}
+// ==================== ④ 主入口 ====================
+if (!isValidUUID(userID)) throw new Error('uuid is not valid');
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request) {
     try {
       const url = new URL(request.url);
-      let dynamicProxyIP = proxyIP; // 默认
-      let pathUUID = null;
-
-      // 动态代理： /proxyip=host:port/<uuid>
-      const proxyMatch = /^\/proxyip=([^/]+)\/([0-9a-f-]{36})$/.exec(url.pathname);
-      if (proxyMatch) {
-        dynamicProxyIP = proxyMatch[1];
-        pathUUID = proxyMatch[2];
-        parseProxyIP(dynamicProxyIP);
-      } else if (url.pathname.length > 1) {
-        // 单段路径直接视为 UUID
-        pathUUID = url.pathname.substring(1);
-      }
-
       const upgrade = request.headers.get('Upgrade');
+
+      // 仅订阅链接支持 ?proxyip=xxx 覆盖（WS 实际使用以路径 /proxyip=... 为准）
+      const qpProxyStr = url.searchParams.get('proxyip') || '';
+      const qpProxy = parseProxyStr(qpProxyStr);
+      const qpValid = !!qpProxy.proxyHost;
+
+      // 路径 UUID（用于返回订阅）
+      const pathUUID = url.pathname.length > 1 ? url.pathname.slice(1) : null;
+
       if (!upgrade || upgrade !== 'websocket') {
-        // ---------------- 非 WS ----------------
-        if (url.pathname === '/') {
-          return new Response('恭喜你快成功了，快去添加 UUID 吧', {
-            status: 200,
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          });
+        // ---------- 非 WebSocket ----------
+        // 展示默认/当前 proxyip 的提示页
+        if (url.pathname === '/' || /^\/proxyip=/i.test(url.pathname)) {
+          const showProxy = extractProxyFromPath(url.pathname) || DEFAULT_PROXY_STR;
+          const text =
+            `恭喜你快成功了！\n\n` +
+            `- 默认 proxyip: ${DEFAULT_PROXY_STR}\n` +
+            `- 当前路径 proxyip: ${showProxy}\n` +
+            `- 订阅可用：/${userID}\n` +
+            `- 可用 query 覆盖订阅中的 proxyip：/${userID}?proxyip=proxyip.kr.zxcs.dpdns.org\n` +
+            `- WS 连接的路径会带 /proxyip=...（动态生效）`;
+          return new Response(text, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8' } });
         }
+
+        // 返回订阅：/{uuid} 或 /{uuid}?proxyip=...
         if (pathUUID && pathUUID === userID) {
-          const cfg = getVLESSConfig(pathUUID, request.headers.get('Host'));
-          return new Response(cfg, {
-            status: 200,
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          });
+          const selected = qpValid ? qpProxyStr : DEFAULT_PROXY_STR;
+          const cfg = getVLESSConfig(pathUUID, request.headers.get('Host'), selected);
+          return new Response(cfg, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8' } });
         }
+
         return new Response('请填写正确的 UUID', {
           status: 400,
           headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         });
       }
 
-      // ---------------- WS ----------------
+      // ---------- WebSocket ----------
       return await vlessOverWSHandler(request);
     } catch (e) {
       return new Response(e.toString(), {
@@ -166,11 +170,16 @@ export default {
   },
 };
 
-// ==================== ⑥ WebSocket 处理 ====================
+// ==================== ⑤ WebSocket 处理（路径决定当前 proxyip） ====================
 async function vlessOverWSHandler(request) {
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
   server.accept();
+
+  // 解析路径中的 proxyip（动态），失败时稍后回退到默认 proxyip
+  const url = new URL(request.url);
+  const pathProxyStr = extractProxyFromPath(url.pathname);
+  const currentProxy = pathProxyStr ? parseProxyStr(pathProxyStr) : { proxyHost: '', proxyPort: null };
 
   const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
   const readableWS = makeReadableWebSocketStream(server, earlyDataHeader);
@@ -179,62 +188,74 @@ async function vlessOverWSHandler(request) {
   let udpWrite = null;
   let isDns = false;
 
-  readableWS.pipeTo(
-    new WritableStream({
-      async write(chunk) {
-        // ---- DNS（UDP）阶段 ----
-        if (isDns && udpWrite) {
-          udpWrite(chunk);
-          return;
+  readableWS.pipeTo(new WritableStream({
+    async write(chunk) {
+      // DNS（UDP）阶段
+      if (isDns && udpWrite) {
+        udpWrite(chunk);
+        return;
+      }
+
+      // 已建立的 TCP 隧道
+      if (remote.value) {
+        const w = remote.value.writable.getWriter();
+        await w.write(chunk);
+        w.releaseLock();
+        return;
+      }
+
+      // 解析 VLESS 首部
+      const {
+        hasError,
+        message,
+        portRemote = 443,
+        addressRemote = '',
+        rawDataIndex,
+        vlessVersion = new Uint8Array([0, 0]),
+        isUDP,
+      } = processVlessHeader(chunk, userID);
+      if (hasError) throw new Error(message);
+
+      // 仅允许 53 端口的 UDP（DNS）
+      if (isUDP) {
+        if (portRemote === 53) {
+          isDns = true;
+        } else {
+          throw new Error('UDP proxy only enable for DNS which is port 53');
         }
+      }
 
-        // ---- 已建立的 TCP 隧道 ----
-        if (remote.value) {
-          const w = remote.value.writable.getWriter();
-          await w.write(chunk);
-          w.releaseLock();
-          return;
+      const vlessRespHeader = new Uint8Array([vlessVersion[0], 0]); // VLESS reply
+      const payload = chunk.slice(rawDataIndex);
+
+      // DNS（UDP）
+      if (isDns) {
+        const { write } = await handleUDPOutBound(server, vlessRespHeader);
+        udpWrite = write;
+        udpWrite(payload);
+        return;
+      }
+
+      // TCP：直连 → 动态 proxyip → 默认 proxyip 的回退链路
+      handleTCPOutBound(
+        remote,
+        addressRemote,
+        portRemote,
+        payload,
+        server,
+        vlessRespHeader,
+        {
+          currentProxy,
+          defaultProxy: defaultProxyConfig,
         }
-
-        // ---- 解析 VLESS 首部 ----
-        const {
-          hasError,
-          message,
-          portRemote = 443,
-          addressRemote = '',
-          rawDataIndex,
-          vlessVersion = new Uint8Array([0, 0]),
-          isUDP,
-        } = processVlessHeader(chunk, userID);
-        if (hasError) throw new Error(message);
-
-        // 只允许 53 端口的 UDP（DNS）
-        if (isUDP) {
-          if (portRemote === 53) isDns = true;
-          else throw new Error('UDP proxy only enable for DNS which is port 53');
-        }
-
-        const vlessRespHeader = new Uint8Array([vlessVersion[0], 0]); // VLESS reply
-        const payload = chunk.slice(rawDataIndex);
-
-        // ---- DNS 处理 ----
-        if (isDns) {
-          const { write } = await handleUDPOutBound(server, vlessRespHeader);
-          udpWrite = write;
-          udpWrite(payload);
-          return;
-        }
-
-        // ---- TCP 处理 ----
-        handleTCPOutBound(remote, addressRemote, portRemote, payload, server, vlessRespHeader);
-      },
-    })
-  ).catch(() => { /* 已在内部自行处理 */ });
+      );
+    },
+  })).catch(() => { /* 已在内部处理 */ });
 
   return new Response(null, { status: 101, webSocket: client });
 }
 
-// ==================== ⑦ 可读 WebSocket 流 ====================
+// ==================== ⑥ 可读 WebSocket 流 ====================
 function makeReadableWebSocketStream(ws, earlyDataHeader) {
   let cancelled = false;
   const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
@@ -243,24 +264,15 @@ function makeReadableWebSocketStream(ws, earlyDataHeader) {
   return new ReadableStream({
     start(controller) {
       if (earlyData) controller.enqueue(new Uint8Array(earlyData));
-
-      ws.addEventListener('message', e => {
-        if (!cancelled) controller.enqueue(e.data);
-      });
-      ws.addEventListener('close', () => {
-        safeCloseWebSocket(ws);
-        if (!cancelled) controller.close();
-      });
+      ws.addEventListener('message', e => { if (!cancelled) controller.enqueue(e.data); });
+      ws.addEventListener('close', () => { safeCloseWebSocket(ws); if (!cancelled) controller.close(); });
       ws.addEventListener('error', err => controller.error(err));
     },
-    cancel() {
-      cancelled = true;
-      safeCloseWebSocket(ws);
-    },
+    cancel() { cancelled = true; safeCloseWebSocket(ws); },
   });
 }
 
-// ==================== ⑧ VLESS Header 解析（防越界） ====================
+// ==================== ⑦ VLESS Header 解析 ====================
 function processVlessHeader(buf, userID) {
   try {
     if (buf.byteLength < 24) throw new Error('invalid data');
@@ -303,7 +315,7 @@ function processVlessHeader(buf, userID) {
         if (buf.byteLength < addrIdx + addrLen) throw new Error('incomplete IPv6');
         const dv = new DataView(buf.slice(addrIdx, addrIdx + addrLen));
         const parts = [];
-        for (let i = 0; i <8; i++) parts.push(dv.getUint16(i * 2).toString(16));
+        for (let i = 0; i < 8; i++) parts.push(dv.getUint16(i * 2).toString(16));
         addr = parts.join(':');
         break;
       default:
@@ -324,8 +336,15 @@ function processVlessHeader(buf, userID) {
   }
 }
 
-// ==================== ⑨ TCP 处理 ====================
-async function handleTCPOutBound(remoteWrap, address, port, initData, ws, respHeader) {
+// ==================== ⑧ TCP 出站（含两级回退） ====================
+async function handleTCPOutBound(remoteWrap, address, port, initData, ws, respHeader, proxies) {
+  const current = proxies?.currentProxy || { proxyHost: '', proxyPort: null };
+  const fallback = proxies?.defaultProxy || { proxyHost: '', proxyPort: null };
+
+  const sameProxy = (a, b) =>
+    (a?.proxyHost || '') === (b?.proxyHost || '') &&
+    (a?.proxyPort ?? null) === (b?.proxyPort ?? null);
+
   async function connectAndWrite(host, p) {
     const sock = connect({ hostname: host, port: p });
     remoteWrap.value = sock;
@@ -335,51 +354,72 @@ async function handleTCPOutBound(remoteWrap, address, port, initData, ws, respHe
     return sock;
   }
 
-  async function fallback() {
-    const host = proxyConfig.proxyHost || address;
-    const p = proxyConfig.proxyPort !== null ? proxyConfig.proxyPort : port;
-    const sock = await connectAndWrite(host, p);
-    sock.closed.catch(() => { }).finally(() => safeCloseWebSocket(ws));
-    remoteSocketToWS(sock, ws, respHeader, null);
+  async function tryDefaultProxy() {
+    if (fallback.proxyHost) {
+      const p = fallback.proxyPort ?? port;
+      const sock = await connectAndWrite(fallback.proxyHost, p);
+      remoteSocketToWS(sock, ws, respHeader, null);
+      sock.closed.catch(() => {}).finally(() => safeCloseWebSocket(ws));
+    } else {
+      safeCloseWebSocket(ws);
+    }
   }
 
-  // 直接连接目标
-  const sock = await connectAndWrite(address, port);
-  remoteSocketToWS(sock, ws, respHeader, fallback);
+  async function tryCurrentProxy() {
+    if (current.proxyHost) {
+      const p = current.proxyPort ?? port;
+      const sock = await connectAndWrite(current.proxyHost, p);
+      // 如果当前动态 proxyip 失败，则回退到默认 proxyip
+      const needDefault = !sameProxy(current, fallback);
+      remoteSocketToWS(sock, ws, respHeader, needDefault ? tryDefaultProxy : null);
+      sock.closed.catch(() => {}).finally(() => { /* ws 由 remoteSocketToWS 管理 */ });
+    } else {
+      // 未提供当前 proxy，则直接尝试默认 proxy
+      await tryDefaultProxy();
+    }
+  }
+
+  // 首先直连目标；若无返回数据或失败，依次尝试 当前 proxyip → 默认 proxyip
+  const directSock = await connectAndWrite(address, port);
+  remoteSocketToWS(directSock, ws, respHeader, tryCurrentProxy);
+  directSock.closed.catch(() => {}).finally(() => { /* ws 由 remoteSocketToWS 管理 */ });
 }
 
-// ==================== ⑩ 远端 TCP 数据回写 WS（使用 Uint8Array 合并） ====================
+// ==================== ⑨ 回写远端 TCP 数据到 WS（支持失败回退） ====================
 async function remoteSocketToWS(remote, ws, vlessHeader, retry) {
   let header = vlessHeader;
   let hasData = false;
+  let failed = false;
 
-  await remote.readable.pipeTo(
-    new WritableStream({
-      async write(chunk) {
-        hasData = true;
-        if (ws.readyState !== WS_READY_STATE_OPEN) throw new Error('WebSocket not open');
-        if (header) {
-          ws.send(concatArrayBuffers(header, chunk));
-          header = null;
-        } else {
-          ws.send(chunk);
-        }
-      },
-    })
-  ).catch(() => safeCloseWebSocket(ws));
+  await remote.readable.pipeTo(new WritableStream({
+    async write(chunk) {
+      hasData = true;
+      if (ws.readyState !== WS_READY_STATE_OPEN) throw new Error('WebSocket not open');
+      if (header) {
+        ws.send(concatArrayBuffers(header, chunk));
+        header = null;
+      } else {
+        ws.send(chunk);
+      }
+    },
+  })).catch(() => { failed = true; });
 
-  // 若目标没有返回任何数据且提供了 retry，则走后备代理
-  if (!hasData && retry) retry();
+  // 若尚未收到任何数据，按需回退（包括动态 proxyip → 默认 proxyip）
+  if (!hasData && retry) {
+    return retry();
+  }
+
+  // 没有回退可用，或已传输过数据则保持现状/关闭
+  if (failed && !retry) safeCloseWebSocket(ws);
 }
 
-// ==================== ⑪ DNS（UDP）处理 – DoH + Accept Header ====================
+// ==================== ⑩ DNS（UDP）处理 – DoH + Accept Header ====================
 async function handleUDPOutBound(ws, vlessHeader) {
   let sentHeader = false;
 
   const transform = new TransformStream({
     transform(chunk, controller) {
-      // 把长度字段拆成若干 UDP 包（长度占 2 字节，随后是数据）
-      for (let i = 0; i < chunk.byteLength; ) {
+      for (let i = 0; i < chunk.byteLength;) {
         const len = new DataView(chunk.buffer, chunk.byteOffset + i, 2).getUint16(0);
         const data = new Uint8Array(chunk.buffer, chunk.byteOffset + i + 2, len);
         controller.enqueue(data);
@@ -388,44 +428,35 @@ async function handleUDPOutBound(ws, vlessHeader) {
     },
   });
 
-  // 每个 DNS 查询发送到 DoH（Google），把返回的二进制报文写回 WS
-  transform.readable.pipeTo(
-    new WritableStream({
-      async write(dQuery) {
-        const resp = await fetch('https://dns.google/dns-query', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/dns-message',
-            Accept: 'application/dns-message',
-          },
-          body: dQuery,
-        });
-        const ans = await resp.arrayBuffer();
-        const sz = ans.byteLength;
-        const szBuf = new Uint8Array([(sz >> 8) & 0xff, sz & 0xff]);
-
-        if (ws.readyState === WS_READY_STATE_OPEN) {
-          if (sentHeader) {
-            ws.send(concatArrayBuffers(szBuf, ans));
-          } else {
-            ws.send(concatArrayBuffers(vlessHeader, szBuf, ans));
-            sentHeader = true;
-          }
+  transform.readable.pipeTo(new WritableStream({
+    async write(dQuery) {
+      const resp = await fetch('https://dns.google/dns-query', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/dns-message',
+          'Accept': 'application/dns-message',
+        },
+        body: dQuery,
+      });
+      const ans = await resp.arrayBuffer();
+      const sz = ans.byteLength;
+      const szBuf = new Uint8Array([(sz >> 8) & 0xff, sz & 0xff]);
+      if (ws.readyState === WS_READY_STATE_OPEN) {
+        if (sentHeader) {
+          ws.send(concatArrayBuffers(szBuf, ans));
+        } else {
+          ws.send(concatArrayBuffers(vlessHeader, szBuf, ans));
+          sentHeader = true;
         }
-      },
-    })
-  ).catch(() => { /* 已在内部吞掉错误 */ });
+      }
+    },
+  })).catch(() => {});
 
   const writer = transform.writable.getWriter();
-
-  return {
-    write(chunk) {
-      writer.write(chunk);
-    },
-  };
+  return { write(chunk) { writer.write(chunk); } };
 }
 
-// ==================== ⑫ 辅助：WebSocket 安全关闭 ====================
+// ==================== ⑪ 辅助：WebSocket 安全关闭 ====================
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 function safeCloseWebSocket(sock) {
