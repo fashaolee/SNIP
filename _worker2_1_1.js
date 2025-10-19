@@ -2,7 +2,7 @@ import { connect } from 'cloudflare:sockets';
 
 // ==================== ① 基础配置 ====================
 let userID = ''; // 请自行替换
-let proxyIP = 'proxyip.cmliussss.net'; // 默认代理，可被 path/query 覆盖
+let proxyIP = 'proxyip.jp.cmliussss.net'; // 默认代理，可被 path/query 覆盖
 
 // 并发回源触发阈值（毫秒）：直连优先，超时并发代理
 const FALLBACK_DELAY_MS = 400;
