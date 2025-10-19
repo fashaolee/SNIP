@@ -137,12 +137,7 @@ export default {
         if (url.pathname === '/' || /^\/proxyip=/i.test(url.pathname)) {
           const showProxy = extractProxyFromPath(url.pathname) || DEFAULT_PROXY_STR;
           const text =
-            `恭喜你快成功了！\n\n` +
-            `- 默认 proxyip: ${DEFAULT_PROXY_STR}\n` +
-            `- 当前路径 proxyip: ${showProxy}\n` +
-            `- 订阅可用：/${userID}\n` +
-            `- 可用 query 覆盖订阅中的 proxyip：/${userID}?proxyip=proxyip.kr.zxcs.dpdns.org\n` +
-            `- WS 连接的路径会带 /proxyip=...（动态生效）`;
+            `恭喜你快成功了！\n\n`;
           return new Response(text, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8' } });
         }
 
