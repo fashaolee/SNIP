@@ -1,8 +1,8 @@
 import { connect } from 'cloudflare:sockets';
 
 // ==================== ① 基础配置 ====================
-let userID = ''; // 请替换成你的 UUID
-const DEFAULT_PROXY_STR = ''; // 默认 proxyip（回退使用）
+let userID = '20efc8d1-d2fa-4e2b-b4b3-773a918cd3ba'; // 请替换成你的 UUID
+const DEFAULT_PROXY_STR = 'proxyip.us.cmliussss.net'; // 默认 proxyip（回退使用）
 
 // 节点别名：T-SNIP-01、T-SNIP-02 ...
 function nodeAlias(idx) {
