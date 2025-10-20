@@ -1,7 +1,7 @@
 import { connect } from 'cloudflare:sockets';
 
 // ==================== ① 基础配置 ====================
-let userID = ''; // 请自行替换
+let userID = 'uuid'; // 请自行替换
 let proxyIP = 'proxyip.cmliussss.net'; // 默认代理，可被 path/query 覆盖
 
 // 速率/资源平衡参数
