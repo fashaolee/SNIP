@@ -1,153 +1,40 @@
-/*=====================================================================
-  Cloudflare Workers VLESS + WebSocket  －  全链路加速版
-  ①  动态 proxyIP（path /proxyip=host[:port] / query ?proxyip=host[:port]）
-  ②  重要目标（Telegram / YouTube / TikTok / 图片 CDN） 0 ms 并发回源
- ③  带宽分配（上传/下载）采用 Token‑Bucket（防止慢启动放大）
- ④  TLS / VLESS 关键首包立即发送（首‑3 秒优先通道）
- ⑤  小文件/API 请求直接透传（无合帧），大文件/长视频使用可选合帧/队列
- ⑥  断流、异常、关闭统一安全处理
-=====================================================================*/
-
 import { connect } from 'cloudflare:sockets';
 
 // ==================== ① 基础配置 ====================
-let USER_ID = '5c4eed9c-4071-4d02-a00f-4ac58221238f';    // 请自行替换
-let DEFAULT_PROXY = 'proxyip.jp.zxcs.dpdns.org';          // 默认代理，可被 path / query 覆盖
+let userID = '5c4eed9c-4071-4d02-a00f-4ac58221238f'; // 请自行替换
+let proxyIP = 'proxyip.jp.zxcs.dpdns.org';           // 默认代理，可被 path/query 覆盖
 
-// ---------- 资源/性能调参（可自行微调） ----------
-const RACE_ENABLED        = true;     // 是否开启并发回源（Happy‑Eyeballs）
-const GEN_RACE_DELAY_MS   = 350;      // 普通域名并发延时
-const MEDIA_RACE_DELAY_MS = 0;        // 视频/图片等媒体域名并发延时（0 ms 同时启动）
-const MAX_EARLY_BUF      = 64 * 1024; // WS→TCP 选路前缓冲上限
-const SEND_HEADER_EARLY   = true;     // 直接在 socket 建立后发送 VLESS 回包头
-const COALESCE_MS_VIDEO   = 6;        // 视频/图片合帧时间窗口（毫秒），0 为禁用
-const COALESCE_MAX_VIDEO  = 64 * 1024;// 合并最大字节数
-const COALESCE_MS_SMALL   = 0;        // 小请求（API、图片缩略图）不合帧
-const COALESCE_MAX_SMALL  = 0;
+// ==================== ② 传输策略配置 ====================
+// 通用连接策略
+const RACE_ENABLED = true;                 // 是否启用并发回源
+const RACE_DELAY_MS = 350;                 // 普通域名并发门限
 
-// ------- 带宽 Token‑Bucket（上传/下载各自独立） -------
-const UP_RATE   = 10 * 1024 * 1024;   // 上传峰值（10 MiB/s）可自行调低
-const DOWN_RATE = 100 * 1024 * 1024;  // 下载峰值（100 MiB/s）可自行调高
-const BUCKET_REFILL_MS = 100;        // Token补充间隔
+// 前5秒极速策略
+const INITIAL_RACE_DELAY = 0;              // 前5秒内0ms并发
+const INITIAL_COALESCE_MS = 1;             // 前5秒聚合窗口1ms
+const INITIAL_COALESCE_MAX = 4096;         // 前5秒最大聚合4KB
 
-// ==================== ② 代理解析（纯函数） ====================
-let proxyConf = { host: '', port: null };
-function parseProxy(str) {
-    proxyConf = { host: '', port: null };
-    if (!str) return;
-    const [h, p] = str.split(':');
-    proxyConf.host = h.trim();
-    if (p) {
-        const num = parseInt(p.trim(), 10);
-        if (!isNaN(num) && num > 0 && num <= 65535) proxyConf.port = num;
-    }
-}
+// 5-15秒加速策略
+const ACCEL_RACE_DELAY = 200;              // 5-15秒并发门限
+const ACCEL_COALESCE_MS = 3;               // 5-15秒聚合窗口3ms
+const ACCEL_COALESCE_MAX = 128 * 1024;      // 5-15秒最大聚合32KB
 
-// ==================== ③ 工具函数 ====================
-function extractProxyFromPath(p) {
-    const m = /^\/proxyip=([^/]+)(?:\/.*)?$/.exec(p);
-    return m ? m[1] : null;
-}
-function effectiveProxy(url) {
-    const fromQ = (url.searchParams.get('proxyip') || '').trim();
-    const fromP = extractProxyFromPath(url.pathname);
-    return fromQ || fromP || DEFAULT_PROXY;
-}
-function concatAB(...arr) {                     // 合并，仅在需要时使用
-    const tot = arr.reduce((s, a) => s + a.byteLength, 0);
-    const out = new Uint8Array(tot);
-    let off = 0;
-    for (const a of arr) { out.set(new Uint8Array(a), off); off += a.byteLength; }
-    return out.buffer;
-}
-function base64ToAB(str) {
-    if (!str) return { error: null };
-    try {
-        const b64 = str.replace(/-/g, '+').replace(/_/g, '/');
-        const dec = atob(b64);
-        const u8 = Uint8Array.from(dec, c => c.charCodeAt(0));
-        return { early: u8.buffer, error: null };
-    } catch (e) { return { error: e }; }
-}
-const TEXT_DEC = new TextDecoder();
+// 稳定期高效策略
+const STABLE_COALESCE_MS = 6;              // 稳定期聚合窗口6ms
+const STABLE_COALESCE_MAX = 256 * 1024;     // 稳定期最大聚合64KB
 
-// UUID 校验
-function isValidUUID(u) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(u); }
-const BYTE2HEX = [...Array(256)].map((_, i) => (i + 256).toString(16).slice(1));
-function unsafeUUID(arr, o = 0) {
-    return (
-        BYTE2HEX[arr[o + 0]] + BYTE2HEX[arr[o + 1]] + BYTE2HEX[arr[o + 2]] + BYTE2HEX[arr[o + 3]] + '-' +
-        BYTE2HEX[arr[o + 4]] + BYTE2HEX[arr[o + 5]] + '-' +
-        BYTE2HEX[arr[o + 6]] + BYTE2HEX[arr[o + 7]] + '-' +
-        BYTE2HEX[arr[o + 8]] + BYTE2HEX[arr[o + 9]] + '-' +
-        BYTE2HEX[arr[o +10]] + BYTE2HEX[arr[o +11]] + BYTE2HEX[arr[o +12]] +
-        BYTE2HEX[arr[o +13]] + BYTE2HEX[arr[o +14]] + BYTE2HEX[arr[o +15]]
-    ).toLowerCase();
-}
-function uuidFromBytes(arr, o = 0) {
-    const u = unsafeUUID(arr, o);
-    if (!isValidUUID(u)) throw new TypeError('Invalid UUID');
-    return u;
-}
+// 媒体特定策略
+const VIDEO_COALESCE_MS = 6;               // 视频聚合窗口
+const VIDEO_COALESCE_MAX = 512 * 1024;      // 视频最大聚合
+const IMAGE_COALESCE_MS = 3;               // 图片聚合窗口
+const IMAGE_COALESCE_MAX = 32 * 1024;      // 图片最大聚合
 
-// ---------------- 媒体/视频域名识别 ----------------
-function isMediaHost(host) {
-    if (!host) return false;
-    const h = host.toLowerCase();
-    // 常见视频/图片 CDN（可自行增删）
-    return (
-        h.includes('googlevideo.com') || h.includes('ytimg.com') ||
-        h.includes('tiktokcdn.com') || h.includes('bytecdn.cn') ||
-        h.includes('cdninstagram.com') || h.includes('fbcdn.net') ||
-        h.includes('akamaihd.net') || h.includes('edgesuite.net') ||
-        h.includes('cdn77.org') || h.includes('cdn-telegram') ||
-        h.includes('telegram.org') || h.includes('t.me') ||
-        h.includes('telegra.ph') || h.includes('.m3u8')
-    );
-}
+// 其他配置
+const MAX_EARLY_BUFFER_BYTES = 64 * 1024;  // WS→TCP 早期缓冲上限
+const SEND_HEADER_EARLY = true;            // 出站连接建立后立即回写VLESS头
+const SMALL_PACKET_THRESHOLD = 1024;       // 小数据包阈值(1KB)
 
-// ---------------- Token‑Bucket（上传/下载） ----------------
-class TokenBucket {
-    constructor(rate) { this.rate = rate; this.tokens = rate; this.last = Date.now(); }
-    async take(bytes) {
-        while (this.tokens < bytes) {
-            await new Promise(r => setTimeout(r, BUCKET_REFILL_MS));
-            const now = Date.now();
-            const add = ((now - this.last) * this.rate) / 1000;
-            this.tokens = Math.min(this.rate, this.tokens + add);
-            this.last = now;
-        }
-        this.tokens -= bytes;
-    }
-}
-const upBucket   = new TokenBucket(UP_RATE);
-const downBucket = new TokenBucket(DOWN_RATE);
-
-// ==================== ④ 订阅生成（path 中携带当前 proxy） ====================
-function makeVlessSub(uid, curHost, proxy) {
-    const path = `/proxyip=${proxy}`;
-    const p = new URLSearchParams({
-        encryption: 'none',
-        security: 'tls',
-        sni: curHost,
-        fp: 'chrome',
-        type: 'ws',
-        host: curHost,
-        path: path,
-        // 以下参数降低客户端 CPU/内存（多数客户端会忽略不认）
-        mux: '1',
-        alpn: 'http/1.1',
-    });
-    const uris = preferredDomains.map((d, i) => {
-        const alias = `T-SNIP_${String(i + 1).padStart(2, '0')}`;
-        return `vless://${uid}@${d}:443?${p.toString()}#${alias}`;
-    });
-    return btoa(uris.join('\n')).replace(/\+/g, '-').replace(/\//g, '_');
-}
-
-// ==================== ⑤ 主入口 ====================
-if (!isValidUUID(USER_ID)) throw new Error('invalid uuid');
-
+// 预设优选域名（保持原有列表）
 const preferredDomains = [
     'store.ubi.com',
     'ip.sb',
@@ -162,90 +49,474 @@ const preferredDomains = [
     'saas.sin.fan',
 ];
 
-export default {
-    async fetch(req, env, ctx) {
+// ==================== ③ 代理信息解析（纯函数） ====================
+let proxyConfig = { proxyHost: '', proxyPort: null };
+function parseProxyIP(inputProxyIP) {
+    proxyConfig = { proxyHost: '', proxyPort: null };
+    if (!inputProxyIP) return;
+    const parts = inputProxyIP.split(':');
+    proxyConfig.proxyHost = parts[0].trim();
+    if (parts.length > 1) {
+        const p = parseInt(parts[1].trim(), 10);
+        if (!isNaN(p) && p > 0 && p <= 65535) proxyConfig.proxyPort = p;
+    }
+}
+
+// ==================== ④ 工具函数（域名识别、解析、流） ====================
+// 从路径提取 /proxyip=...（可带后续段）
+function extractProxyFromPath(pathname) {
+    const m = /^\/proxyip=([^/]+)(?:\/.*)?$/.exec(pathname);
+    return m ? m[1] : null;
+}
+// 计算本次请求生效的 proxyip
+function getEffectiveProxyIP(url) {
+    const fromQuery = (url.searchParams.get('proxyip') || '').trim();
+    const fromPath = extractProxyFromPath(url.pathname);
+    return fromQuery || fromPath || proxyIP;
+}
+// 域名分类识别
+function isTelegramHost(host) {
+    if (!host) return false;
+    const h = host.toLowerCase();
+    return (
+        /(^|\.)t\.me$/.test(h) ||
+        /(^|\.)telegra\.ph$/.test(h) ||
+        h.endsWith('.telegram.org') ||
+        h.includes('telegram-cdn') ||
+        h.includes('cdn-telegram')
+    );
+}
+function isVideoHost(host) {
+    if (!host) return false;
+    const h = host.toLowerCase();
+    return (
+        h.includes('googlevideo.com') || h.includes('gvt1.com') || // YouTube
+        h.includes('youtube.com') || h.includes('ytimg.com') ||
+        h.includes('tiktokcdn.com') || h.includes('muscdn.com') || // TikTok
+        h.includes('bytecdn.cn') || h.includes('byteimg.com') ||
+        h.includes('fbcdn.net') || h.includes('cdninstagram.com') ||
+        h.includes('vimeocdn.com') || h.includes('vimeo.com') ||
+        h.includes('nflxvideo.net') || h.includes('netflix.com') ||
+        h.includes('akamaized.net') || h.includes('edgesuite.net') ||
+        h.includes('hls') || h.includes('.m3u8') // 粗粒度匹配
+    );
+}
+function isImageHost(host) {
+    if (!host) return false;
+    const h = host.toLowerCase();
+    return (
+        h.includes('instagram.com') ||
+        h.includes('fbcdn.net') ||
+        h.includes('cdninstagram.com') ||
+        h.includes('pinterest.com') ||
+        h.includes('pinimg.com') ||
+        h.includes('twitter.com') ||
+        h.includes('twimg.com') ||
+        h.includes('tiktok.com') ||
+        h.includes('tiktokcdn.com') ||
+        h.includes('telegram.org') ||
+        h.includes('t.me') ||
+        h.includes('telegra.ph') ||
+        h.includes('telegram-cdn')
+    );
+}
+function isMediaHost(host) {
+    return isVideoHost(host) || isImageHost(host);
+}
+
+// TLS握手检测
+function isTLSHandshake(chunk) {
+    if (!(chunk instanceof Uint8Array) || chunk.byteLength < 5) return false;
+    // TLS握手记录类型为0x16 (Handshake)
+    return chunk[0] === 0x16;
+}
+
+// 合并多个 Uint8Array 为一个 ArrayBuffer
+function concatArrayBuffers(...arrays) {
+    const total = arrays.reduce((sum, a) => sum + a.byteLength, 0);
+    const tmp = new Uint8Array(total);
+    let offset = 0;
+    for (const a of arrays) {
+        tmp.set(new Uint8Array(a), offset);
+        offset += a.byteLength;
+    }
+    return tmp.buffer;
+}
+
+// base64 → Uint8Array
+function base64ToArrayBuffer(base64Str) {
+    if (!base64Str) return { error: null };
+    try {
+        const b64 = base64Str.replace(/-/g, '+').replace(/_/g, '/');
+        const dec = atob(b64);
+        const u8 = Uint8Array.from(dec, c => c.charCodeAt(0));
+        return { earlyData: u8.buffer, error: null };
+    } catch (e) {
+        return { error: e };
+    }
+}
+
+// 复用解码器
+const TEXT_DECODER = new TextDecoder();
+
+// UUID 检验 & 字符串化
+function isValidUUID(uuid) {
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    return uuidRegex.test(uuid);
+}
+const byteToHex = [];
+for (let i = 0; i < 256; ++i) byteToHex.push((i + 256).toString(16).slice(1));
+function unsafeStringify(arr, offset = 0) {
+    return (
+        byteToHex[arr[offset + 0]] + byteToHex[arr[offset + 1]] + byteToHex[arr[offset + 2]] + byteToHex[arr[offset + 3]] + "-" +
+        byteToHex[arr[offset + 4]] + byteToHex[arr[offset + 5]] + "-" +
+        byteToHex[arr[offset + 6]] + byteToHex[arr[offset + 7]] + "-" +
+        byteToHex[arr[offset + 8]] + byteToHex[arr[offset + 9]] + "-" +
+        byteToHex[arr[offset + 10]] + byteToHex[arr[offset + 11]] + byteToHex[arr[offset + 12]] +
+        byteToHex[arr[offset + 13]] + byteToHex[arr[offset + 14]] + byteToHex[arr[offset + 15]]
+    ).toLowerCase();
+}
+function stringify(arr, offset = 0) {
+    const uuid = unsafeStringify(arr, offset);
+    if (!isValidUUID(uuid)) throw TypeError('Stringified UUID is invalid');
+    return uuid;
+}
+
+// ==================== ⑤ 智能多阶段传输引擎 ====================
+class SmartWSSender {
+    constructor(ws, vlessHeader) {
+        this.ws = ws;
+        this.vlessHeader = vlessHeader;
+        this.headerSent = false;
+        this.parts = [];
+        this.totalBytes = 0;
+        this.flushTimer = null;
+        this.connectionType = 'general';
+        this.startTime = Date.now();
+        this.trafficLevel = 'low'; // 'low', 'medium', 'high'
+        this.lastDataTime = Date.now();
+    }
+
+    // 设置连接类型（视频/图片/普通）
+    setConnectionType(type) {
+        this.connectionType = type;
+        this.resetFlushTimer();
+    }
+
+    // 获取当前传输策略
+    getStrategy() {
+        const elapsed = Date.now() - this.startTime;
+        
+        // 前5秒：极速模式
+        if (elapsed < 5000) {
+            return {
+                coalesceMs: INITIAL_COALESCE_MS,
+                maxBytes: INITIAL_COALESCE_MAX,
+                immediateTypes: ['tls', 'small']
+            };
+        }
+        
+        // 5-15秒：加速模式
+        if (elapsed < 15000) {
+            return {
+                coalesceMs: ACCEL_COALESCE_MS,
+                maxBytes: ACCEL_COALESCE_MAX,
+                immediateTypes: ['tls']
+            };
+        }
+        
+        // 视频连接：高效模式
+        if (this.connectionType === 'video') {
+            return {
+                coalesceMs: VIDEO_COALESCE_MS,
+                maxBytes: VIDEO_COALESCE_MAX,
+                immediateTypes: ['tls']
+            };
+        }
+        
+        // 图片连接：优化加载模式
+        if (this.connectionType === 'image') {
+            return {
+                coalesceMs: IMAGE_COALESCE_MS,
+                maxBytes: IMAGE_COALESCE_MAX,
+                immediateTypes: ['tls', 'small']
+            };
+        }
+        
+        // 普通连接：高效模式
+        return {
+            coalesceMs: STABLE_COALESCE_MS,
+            maxBytes: STABLE_COALESCE_MAX,
+            immediateTypes: ['tls']
+        };
+    }
+
+    // 识别数据包类型
+    identifyChunkType(chunk) {
+        if (isTLSHandshake(chunk)) return 'tls';
+        if (chunk instanceof Uint8Array && chunk.byteLength <= SMALL_PACKET_THRESHOLD) return 'small';
+        return 'general';
+    }
+
+    // 确保头已发送
+    ensureHeaderSent() {
+        if (!this.headerSent && this.ws.readyState === WS_READY_STATE_OPEN) {
+            this.ws.send(this.vlessHeader);
+            this.headerSent = true;
+        }
+    }
+
+    // 立即发送单个数据块
+    sendImmediately(chunk) {
+        this.ensureHeaderSent();
+        if (this.ws.readyState === WS_READY_STATE_OPEN) {
+            this.ws.send(chunk);
+        }
+    }
+
+    // 冲刷所有聚合数据
+    flush() {
+        if (this.flushTimer) {
+            clearTimeout(this.flushTimer);
+            this.flushTimer = null;
+        }
+        
+        if (this.parts.length === 0) return;
+        
         try {
-            const url = new URL(req.url);
-            parseProxy(effectiveProxy(url));                     // 解析本次请求的 proxyIP
+            // 合并数据
+            const total = this.parts.reduce((sum, p) => sum + p.byteLength, 0);
+            const buffer = new Uint8Array(total);
+            let offset = 0;
+            
+            for (const part of this.parts) {
+                const u8 = part instanceof Uint8Array ? part : new Uint8Array(part);
+                buffer.set(u8, offset);
+                offset += u8.byteLength;
+            }
+            
+            // 发送合并数据
+            this.ensureHeaderSent();
+            if (this.ws.readyState === WS_READY_STATE_OPEN) {
+                this.ws.send(buffer);
+            }
+            
+            // 重置状态
+            this.parts = [];
+            this.totalBytes = 0;
+        } catch (e) {
+            console.error('SmartWSSender flush error:', e);
+        }
+    }
 
-            // 解析 UUID（/UUID 或 /proxyip=host[:port]/UUID）
-            let uuid = null;
-            const m = /^\/proxyip=([^/]+)(?:\/([0-9a-f-]{36}))?$/.exec(url.pathname);
-            if (m && m[2]) uuid = m[2];
-            else if (url.pathname.length > 1) uuid = url.pathname.slice(1);
+    // 重置刷新计时器
+    resetFlushTimer() {
+        const strategy = this.getStrategy();
+        
+        if (this.flushTimer) {
+            clearTimeout(this.flushTimer);
+            this.flushTimer = null;
+        }
+        
+        if (strategy.coalesceMs > 0 && this.totalBytes < strategy.maxBytes) {
+            this.flushTimer = setTimeout(() => {
+                this.flushTimer = null;
+                this.flush();
+            }, strategy.coalesceMs);
+        } else {
+            this.flush();
+        }
+    }
 
-            const upgrade = req.headers.get('Upgrade');
-            // ----------------- 非 WS（订阅、提示） -----------------
-            if (!upgrade || upgrade !== 'websocket') {
+    // 添加数据块到发送队列
+    push(chunk) {
+        if (this.ws.readyState !== WS_READY_STATE_OPEN) {
+            return;
+        }
+        
+        this.lastDataTime = Date.now();
+        const strategy = this.getStrategy();
+        const chunkType = this.identifyChunkType(chunk);
+        
+        // 关键数据包立即发送
+        if (strategy.immediateTypes.includes(chunkType)) {
+            this.flush(); // 先发送所有积压数据
+            this.sendImmediately(chunk);
+            return;
+        }
+        
+        // 小数据包特殊处理
+        if (chunkType === 'small' && this.parts.length === 0) {
+            this.sendImmediately(chunk);
+            return;
+        }
+        
+        // 添加到聚合队列
+        this.parts.push(chunk);
+        this.totalBytes += chunk instanceof Uint8Array ? chunk.byteLength : chunk.byteLength;
+        
+        // 超过最大聚合大小，立即刷新
+        if (this.totalBytes >= strategy.maxBytes) {
+            this.flush();
+        } else {
+            this.resetFlushTimer();
+        }
+        
+        // 更新流量级别
+        if (this.totalBytes > 1024 * 1024) {
+            this.trafficLevel = 'high';
+        } else if (this.totalBytes > 128 * 1024) {
+            this.trafficLevel = 'medium';
+        } else {
+            this.trafficLevel = 'low';
+        }
+    }
+
+    // 关闭发送器
+    close() {
+        this.flush();
+        
+        if (this.flushTimer) {
+            clearTimeout(this.flushTimer);
+            this.flushTimer = null;
+        }
+        
+        this.parts = [];
+        this.totalBytes = 0;
+    }
+}
+
+// ==================== ⑥ VLESS 配置生成 ====================
+function getVLESSConfig(userID, currentHost, proxyHostPort) {
+    const protocol = 'vless';
+    const path = `/proxyip=${proxyHostPort}`;
+    const params = new URLSearchParams({
+        encryption: 'none',
+        security: 'tls',
+        sni: currentHost,
+        fp: 'chrome',
+        type: 'ws',
+        host: currentHost,
+        path: path,
+        // 客户端优化参数
+        mux: '1',
+        alpn: 'http/1.1',
+        // 为媒体连接添加特殊参数
+        'video-params': 'buffer=128;maxrate=5000',
+        'image-params': 'preload=full;quality=high'
+    });
+
+    const allVlessUris = preferredDomains.map((domain, idx) => {
+        const alias = `T-SNIP_${String(idx + 1).padStart(2, '0')}`;
+        return `${protocol}://${userID}@${domain}:443?${params.toString()}#${alias}`;
+    });
+
+    const sub = allVlessUris.join('\n');
+    return btoa(sub).replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+// ==================== ⑦ 主入口 ====================
+if (!isValidUUID(userID)) {
+    throw new Error('uuid is not valid');
+}
+
+export default {
+    async fetch(request, env, ctx) {
+        try {
+            const url = new URL(request.url);
+
+            // 计算本次请求的生效 proxyip，并设置到全局 proxyConfig
+            const effectiveProxyIP = getEffectiveProxyIP(url);
+            parseProxyIP(effectiveProxyIP);
+
+            // 解析路径中的 UUID（支持 /UUID 与 /proxyip=.../UUID）
+            let pathUUID = null;
+            const pm = /^\/proxyip=([^/]+)(?:\/([0-9a-f-]{36}))?$/.exec(url.pathname);
+            if (pm && pm[2]) {
+                pathUUID = pm[2];
+            } else if (url.pathname.length > 1) {
+                pathUUID = url.pathname.substring(1);
+            }
+
+            const upgradeHeader = request.headers.get('Upgrade');
+            if (!upgradeHeader || upgradeHeader !== 'websocket') {
+                // ---------- 非 WebSocket ----------
                 if (url.pathname === '/') {
-                    return new Response('✅ 配置成功，使用 UUID 获取订阅。可通过 ?proxyip=host[:port] 或 /proxyip=host[:port]/UUID 覆盖代理', {
+                    return new Response('服务已启动。请添加UUID访问，支持动态代理设置。', {
                         status: 200,
                         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
                     });
                 }
-                if (uuid && uuid === USER_ID) {
-                    const cfg = makeVlessSub(uuid, req.headers.get('Host'), effectiveProxy(url));
-                    return new Response(cfg, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8' } });
+                if (pathUUID && pathUUID === userID) {
+                    const cfg = getVLESSConfig(pathUUID, request.headers.get('Host'), effectiveProxyIP);
+                    return new Response(cfg, {
+                        status: 200,
+                        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                    });
                 }
-                return new Response('❌ UUID 错误', { status: 400, headers: { 'Content-Type': 'text/plain;charset=utf-8' } });
+                return new Response('无效的UUID', {
+                    status: 400,
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                });
             }
 
-            // ----------------- WebSocket -----------------
-            return await handleWS(req);
-        } catch (e) {
-            return new Response(e.toString(), { status: 500, headers: { 'Content-Type': 'text/plain;charset=utf-8' } });
+            // ---------- WebSocket ----------
+            return await vlessOverWSHandler(request);
+        } catch (err) {
+            return new Response(err.toString(), {
+                status: 500,
+                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            });
         }
     },
 };
 
-// ==================== ⑥ WebSocket 主处理 ====================
-async function handleWS(request) {
+// ==================== ⑧ WebSocket 处理（终极优化版） ====================
+async function vlessOverWSHandler(request) {
     const url = new URL(request.url);
-    parseProxy(effectiveProxy(url));
+    const effProxy = getEffectiveProxyIP(url);
+    parseProxyIP(effProxy);
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
 
-    const earlyHeader = request.headers.get('sec-websocket-protocol') || '';
-    const wsRead = makeWSReadable(server, earlyHeader);
+    const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
+    const readableWS = makeReadableWebSocketStream(server, earlyDataHeader);
 
-    // -------------------------------------------------
-    // 远端状态对象（共享）
-    // -------------------------------------------------
+    // 复用 writer + 有界缓冲
     const remote = {
-        sock: null,
+        value: null,
         writer: null,
-        ready: false,               // 已选路并可写
-        start: false,               // 已解析 VLESS 首包
-        earlyBuf: [],               // 选路前缓冲
+        ready: false,
+        started: false,
+        earlyBuf: [],
         earlyBytes: 0,
-        media: false,               // 是否媒体（视频/图片）流
     };
     let udpWrite = null;
-    let isDNS = false;
+    let isDns = false;
+    let wsSender = null;
 
-    // ---- WS 关闭时同步关闭远端 socket ----
-    server.addEventListener('close', () => { try { remote.sock?.close(); } catch {} });
-    server.addEventListener('error', () => { try { remote.sock?.close(); } catch {} });
+    // 断流优化：WS 侧关闭则关闭远端 socket
+    server.addEventListener('close', () => { try { remote.value && remote.value.close(); } catch {} });
+    server.addEventListener('error', () => { try { remote.value && remote.value.close(); } catch {} });
 
-    // -------------------------------------------------
-    // WS → Remote（上传）管道
-    // -------------------------------------------------
-    wsRead.pipeTo(new WritableStream({
+    readableWS.pipeTo(new WritableStream({
         async write(chunk) {
             // DNS 直通
-            if (isDNS && udpWrite) { udpWrite(chunk); return; }
+            if (isDns && udpWrite) {
+                udpWrite(chunk);
+                return;
+            }
 
-            // 已选路，直接写（使用 writer 复用，减锁开销）
+            // 已选路：直接写入（复用单一 writer）
             if (remote.ready && remote.writer) {
-                await upBucket.take(chunk.byteLength);          // 上传限速
                 await remote.writer.write(chunk);
                 return;
             }
 
-            // 第一次数据，解析 VLESS 头部
-            if (!remote.start) {
+            // 首次数据：解析 VLESS 头
+            if (!remote.started) {
                 const {
                     hasError,
                     message,
@@ -254,122 +525,147 @@ async function handleWS(request) {
                     rawDataIndex,
                     vlessVersion = new Uint8Array([0, 0]),
                     isUDP,
-                } = processVlessHeader(chunk, USER_ID);
+                } = processVlessHeader(chunk, userID);
                 if (hasError) throw new Error(message);
 
-                // UDP 仅 DNS（53）放行
+                // 仅放行 DNS UDP（53）
                 if (isUDP) {
-                    if (portRemote !== 53) throw new Error('Only DNS UDP allowed');
-                    isDNS = true;
+                    if (portRemote === 53) {
+                        isDns = true;
+                    } else {
+                        throw new Error('UDP proxy only enable for DNS which is port 53');
+                    }
                 }
 
-                const respHeader = new Uint8Array([vlessVersion[0], 0]); // VLESS REPLY
-                const payload = chunk.slice(rawDataIndex);
+                const vlessRespHeader = new Uint8Array([vlessVersion[0], 0]);
+                const rawClient = chunk.slice(rawDataIndex);
 
-                // DNS 处理
-                if (isDNS) {
-                    const { write } = await handleUDPOutBound(server, respHeader);
+                if (isDns) {
+                    const { write } = await handleUDPOutBound(server, vlessRespHeader);
                     udpWrite = write;
-                    udpWrite(payload);
-                    remote.start = true;
+                    udpWrite(rawClient);
+                    remote.started = true;
                     return;
                 }
 
-                // 判断是否媒体流（视频/图片），决定后面合帧策略
-                remote.media = isMediaHost(addressRemote);
+                // 智能连接类型识别
+                let connectionType = 'general';
+                if (isVideoHost(addressRemote)) {
+                    connectionType = 'video';
+                } else if (isImageHost(addressRemote)) {
+                    connectionType = 'image';
+                }
 
-                // 启动 TCP 连接（带并发竞速、带宽调度、首‑3 秒极速响应）
-                startTCPWithSpeedControl(remote, addressRemote, portRemote, payload, server, respHeader);
-                remote.start = true;
+                // 创建智能发送器
+                wsSender = new SmartWSSender(server, vlessRespHeader);
+                wsSender.setConnectionType(connectionType);
+
+                // 启动 TCP（智能策略）
+                handleTCPOutBoundOptimized(remote, addressRemote, portRemote, rawClient, server, wsSender, {
+                    connectionType,
+                    address: addressRemote
+                });
+                remote.started = true;
                 return;
             }
 
-            // 尚未选路：使用有界缓冲防止内存暴涨
-            if (remote.earlyBytes + chunk.byteLength <= MAX_EARLY_BUF) {
+            // 尚未选路：进入早期有界缓冲
+            if (remote.earlyBytes + chunk.byteLength <= MAX_EARLY_BUFFER_BYTES) {
                 remote.earlyBuf.push(chunk);
                 remote.earlyBytes += chunk.byteLength;
             } else {
-                // 超出阈值直接写（若 writer 已创建）或丢弃（极端保护）
+                // 超出上限：限制内存增长
                 if (remote.writer) {
-                    await upBucket.take(chunk.byteLength);
                     await remote.writer.write(chunk);
                 }
             }
         },
-    })).catch(() => { /* 已在内部自行处理 */ });
+    })).catch(() => { /* 流已在内部处理 */ });
 
     return new Response(null, { status: 101, webSocket: client });
 }
 
-// ==================== ⑦ 可读 WS 流 ====================
-function makeWSReadable(ws, earlyDataHeader) {
-    let canceled = false;
-    const { earlyData } = base64ToAB(earlyDataHeader);
+// ==================== ⑨ 可读 WebSocket 流 ====================
+function makeReadableWebSocketStream(ws, earlyDataHeader) {
+    let cancelled = false;
+    const { earlyData } = base64ToArrayBuffer(earlyDataHeader);
+
     return new ReadableStream({
         start(controller) {
             if (earlyData) controller.enqueue(new Uint8Array(earlyData));
-
             ws.addEventListener('message', e => {
-                if (!canceled) controller.enqueue(e.data);
+                if (cancelled) return;
+                controller.enqueue(e.data);
             });
             ws.addEventListener('close', () => {
                 safeCloseWebSocket(ws);
-                if (!canceled) controller.close();
+                if (!cancelled) controller.close();
             });
             ws.addEventListener('error', err => controller.error(err));
         },
         cancel() {
-            canceled = true;
+            cancelled = true;
             safeCloseWebSocket(ws);
         },
     });
 }
 
-// ==================== ⑧ VLESS Header 解析 ====================
-function processVlessHeader(buf, uid) {
+// ==================== ⑩ VLESS Header 解析（防越界） ====================
+function processVlessHeader(buf, userID) {
     try {
         if (buf.byteLength < 24) throw new Error('invalid data');
-        const ver = new Uint8Array(buf.slice(0, 1));
-        const uuid = uuidFromBytes(new Uint8Array(buf.slice(1, 17)));
-        if (uuid !== uid.toLowerCase()) throw new Error('invalid user');
+
+        const version = new Uint8Array(buf.slice(0, 1));
+        const uuidStr = stringify(new Uint8Array(buf.slice(1, 17)));
+        if (uuidStr !== userID.toLowerCase()) throw new Error('invalid user');
+
         const optLen = new Uint8Array(buf.slice(17, 18))[0];
         const cmdIdx = 18 + optLen;
         const cmd = new Uint8Array(buf.slice(cmdIdx, cmdIdx + 1))[0];
         const isUDP = cmd === 2;
-        if (cmd !== 1 && !isUDP) throw new Error(`unsupported cmd ${cmd}`);
-        const port = new DataView(buf.slice(cmdIdx + 1, cmdIdx + 3)).getUint16(0);
-        let aIdx = cmdIdx + 3;
-        const addrType = new Uint8Array(buf.slice(aIdx, aIdx + 1))[0];
-        aIdx += 1;
+        if (cmd !== 1 && !isUDP) throw new Error(`unsupported command ${cmd}`);
 
-        let address = '', addrLen = 0;
+        const portIdx = cmdIdx + 1;
+        if (buf.byteLength < portIdx + 2) throw new Error('missing port');
+        const port = new DataView(buf.slice(portIdx, portIdx + 2)).getUint16(0);
+
+        let addrIdx = portIdx + 2;
+        if (buf.byteLength < addrIdx + 1) throw new Error('missing address type');
+        const addrType = new Uint8Array(buf.slice(addrIdx, addrIdx + 1))[0];
+        addrIdx += 1;
+
+        let addr = '', addrLen = 0;
         switch (addrType) {
             case 1: // IPv4
                 addrLen = 4;
-                address = new Uint8Array(buf.slice(aIdx, aIdx + 4)).join('.');
+                if (buf.byteLength < addrIdx + addrLen) throw new Error('incomplete IPv4');
+                addr = new Uint8Array(buf.slice(addrIdx, addrIdx + addrLen)).join('.');
                 break;
             case 2: // Domain
-                addrLen = new Uint8Array(buf.slice(aIdx, aIdx + 1))[0];
-                aIdx += 1;
-                address = TEXT_DEC.decode(buf.slice(aIdx, aIdx + addrLen));
+                addrLen = new Uint8Array(buf.slice(addrIdx, addrIdx + 1))[0];
+                addrIdx += 1;
+                if (buf.byteLength < addrIdx + addrLen) throw new Error('incomplete domain');
+                addr = TEXT_DECODER.decode(buf.slice(addrIdx, addrIdx + addrLen));
                 break;
             case 3: // IPv6
                 addrLen = 16;
-                const dv = new DataView(buf.slice(aIdx, aIdx + 16));
+                if (buf.byteLength < addrIdx + addrLen) throw new Error('incomplete IPv6');
+                const dv = new DataView(buf.slice(addrIdx, addrIdx + addrLen));
                 const parts = [];
                 for (let i = 0; i < 8; i++) parts.push(dv.getUint16(i * 2).toString(16));
-                address = parts.join(':');
+                addr = parts.join(':');
                 break;
             default:
-                throw new Error(`invalid address type ${addrType}`);
+                throw new Error(`invalid addressType ${addrType}`);
         }
-        const rawIdx = aIdx + addrLen;
+
+        const rawIdx = addrIdx + addrLen;
         return {
             hasError: false,
-            addressRemote: address,
+            addressRemote: addr,
             portRemote: port,
             rawDataIndex: rawIdx,
-            vlessVersion: ver,
+            vlessVersion: version,
             isUDP,
         };
     } catch (e) {
@@ -377,52 +673,65 @@ function processVlessHeader(buf, uid) {
     }
 }
 
-// ==================== ⑨ TCP + 带宽控制 + 竞速 ====================
-async function startTCPWithSpeedControl(remote, host, port, initData, ws, vlessHeader) {
+// ==================== ⑪ 智能TCP处理（终极优化版） ====================
+async function handleTCPOutBoundOptimized(remote, address, port, initData, ws, wsSender, opts = {}) {
     if (remote._active) return;
     remote._active = true;
 
-    const needRace   = RACE_ENABLED && proxyConf.host;                 // 是否要并发代理
-    const mediaMode  = remote.media;
-    const raceDelay  = mediaMode ? MEDIA_RACE_DELAY_MS : GEN_RACE_DELAY_MS;
-    const coalesceMs = mediaMode ? COALESCE_MS_VIDEO : COALESCE_MS_SMALL;
-    const coalesceMx = mediaMode ? COALESCE_MAX_VIDEO : COALESCE_MAX_SMALL;
+    const { connectionType, address: addressRemote } = opts;
+    const startTime = Date.now();
+    
+    // 智能并发策略
+    let raceDelay;
+    if (!RACE_ENABLED || !proxyConfig.proxyHost) {
+        raceDelay = null;
+    } else {
+        const elapsed = Date.now() - startTime;
+        if (elapsed < 5000) {
+            raceDelay = INITIAL_RACE_DELAY; // 前5秒0ms并发
+        } else if (elapsed < 15000) {
+            raceDelay = ACCEL_RACE_DELAY;   // 5-15秒加速并发
+        } else {
+            raceDelay = RACE_DELAY_MS;      // 稳定期标准并发
+        }
+    }
 
-    let chosen = null;      // 'direct' | 'proxy'
+    let selected = null; // 'direct' | 'proxy'
     let directSock = null;
     let proxySock = null;
-    let timer = null;
+    let fallbackTimer = null;
     let closed = false;
-    let headerSent = false;
 
-    // ----------------- WS 发送器（合帧/分帧） -----------------
-    const wsSender = createWSSender(ws, vlessHeader, {
-        coalesceMs,
-        maxBytes: coalesceMx,
-        earlyHeader: SEND_HEADER_EARLY,
-    });
+    // 确保头尽早发送
+    if (SEND_HEADER_EARLY) {
+        wsSender.ensureHeaderSent();
+    }
 
-    // ----------------- 选路成功后统一处理 -----------------
+    function clearFallbackTimer() {
+        if (fallbackTimer) { try { clearTimeout(fallbackTimer); } catch {} fallbackTimer = null; }
+    }
+
     async function becomeWinner(sock, label) {
-        if (chosen) return;
-        chosen = label;
-        clearTimeout(timer);
-        // 关闭失败方
+        selected = label;
+        clearFallbackTimer();
+
+        // 关闭败者
         try { if (label === 'direct' && proxySock) proxySock.close(); } catch {}
         try { if (label === 'proxy' && directSock) directSock.close(); } catch {}
 
-        remote.sock   = sock;
+        // 建立 writer，冲刷早期缓冲
+        remote.value = sock;
         remote.writer = sock.writable.getWriter();
-
-        // 先把先前缓冲（选路前的 WS→TCP）写完
         if (remote.earlyBuf.length) {
-            for (const b of remote.earlyBuf) await remote.writer.write(b);
-            remote.earlyBuf = []; remote.earlyBytes = 0;
+            for (const buf of remote.earlyBuf) {
+                await remote.writer.write(buf);
+            }
+            remote.earlyBuf.length = 0;
+            remote.earlyBytes = 0;
         }
         remote.ready = true;
     }
 
-    // ----------------- 读取远端并写回 WS（下载） -----------------
     async function startReader(sock, label) {
         const reader = sock.readable.getReader();
         try {
@@ -432,159 +741,156 @@ async function startTCPWithSpeedControl(remote, host, port, initData, ws, vlessH
                 if (done) break;
                 if (closed) break;
 
-                // 选路：第一次收到数据即决定
-                if (!chosen) await becomeWinner(sock, label);
+                if (!selected) await becomeWinner(sock, label);
 
-                // 第一次到来时立即发送 VLESS 回包头（如果尚未发送）
-                if (first && SEND_HEADER_EARLY && !headerSent) {
-                    wsSender.sendHeader();          // 只发送一次
-                    headerSent = true;
+                // 首包尽早回头，减少客户端等待转圈
+                if (first) {
+                    if (SEND_HEADER_EARLY && !wsSender.headerSent && ws.readyState === WS_READY_STATE_OPEN) {
+                        wsSender.push(new Uint8Array(0)); // 触发 header 发送
+                    }
+                    first = false;
                 }
-                first = false;
 
-                // 下载限速（Token‑Bucket）
-                await downBucket.take(value.byteLength);
-                wsSender.push(value);               // 交给合帧器
+                // 远端→WS：根据智能策略发送
+                wsSender.push(value);
             }
-        } catch { /* ignore */ }
-        finally {
+        } catch (e) {
+            console.error('TCP reader error:', e);
+        } finally {
             try { reader.releaseLock(); } catch {}
-            // 当赢者的流结束时，先把队列冲刷再关闭 WS
-            if (chosen === label && !closed) {
-                wsSender.flush();   // 确保所有积攒的帧都发送
+            if (!closed && selected === label) {
+                // 断流优化：先刷队列再关闭 WS
+                try { wsSender.flush(); } catch {}
                 closed = true;
                 safeCloseWebSocket(ws);
+                wsSender.close();
             }
         }
     }
 
-    // ----------------- 直接连接 -----------------
-    directSock = connect({ hostname: host, port });
+    // 启动直连 + 首包写入
     try {
+        directSock = connect({ hostname: address, port });
+        
         const w = directSock.writable.getWriter();
-        await w.write(initData);                 // 首包写入
+        await w.write(initData);
         w.releaseLock();
-        if (SEND_HEADER_EARLY && !headerSent) { wsSender.sendHeader(); headerSent = true; }
-    } catch { /* 若写入异常，后续会由 reader 处理 */ }
-    startReader(directSock, 'direct');
-
-    // ----------------- 代理并发（可选） -----------------
-    if (needRace) {
-        const launchProxy = async () => {
-            if (chosen || closed) return;
+        
+        // 建连后如需尽早让客户端确认连接，立即送回头（空帧触发 header）
+        if (SEND_HEADER_EARLY && !wsSender.headerSent && ws.readyState === WS_READY_STATE_OPEN) {
+            wsSender.push(new Uint8Array(0));
+        }
+    } catch (e) {
+        console.error('Direct connection error:', e);
+        // 如果直连失败，尝试直接启动代理
+        if (RACE_ENABLED && proxyConfig.proxyHost) {
             try {
                 proxySock = connect({
-                    hostname: proxyConf.host,
-                    port: proxyConf.port !== null ? proxyConf.port : port,
+                    hostname: proxyConfig.proxyHost,
+                    port: proxyConfig.proxyPort !== null ? proxyConfig.proxyPort : port,
                 });
                 const w2 = proxySock.writable.getWriter();
                 await w2.write(initData);
                 w2.releaseLock();
-                if (SEND_HEADER_EARLY && !headerSent) { wsSender.sendHeader(); headerSent = true; }
+                if (SEND_HEADER_EARLY && !wsSender.headerSent && ws.readyState === WS_READY_STATE_OPEN) {
+                    wsSender.push(new Uint8Array(0));
+                }
                 startReader(proxySock, 'proxy');
-            } catch { /* 代理失败时保持直连 */ }
-        };
-        if (raceDelay <= 0) launchProxy();                 // 立即并发（媒体域名）
-        else timer = setTimeout(launchProxy, raceDelay);   // 延迟并发（普通域名）
-    }
-}
-
-// ==================== ⑩ WS Sender（合帧/分帧） ====================
-function createWSSender(ws, header, opts) {
-    const { coalesceMs = 0, maxBytes = 0, earlyHeader = true } = opts;
-    let headerSent = false;
-    let bufParts = [];
-    let bufSize  = 0;
-    let timer    = null;
-    let closed   = false;
-
-    function sendHeader() {
-        if (headerSent) return;
-        ws.send(header);
-        headerSent = true;
-    }
-
-    function scheduleFlush() {
-        if (timer || coalesceMs <= 0) return;
-        timer = setTimeout(flush, coalesceMs);
-    }
-
-    function flush() {
-        if (closed) return;
-        if (timer) { clearTimeout(timer); timer = null; }
-        if (!headerSent) sendHeader();
-        if (bufSize === 0) return;
-        // 合并一次发送（一次 copy，只在需要合帧时才做）
-        const out = new Uint8Array(bufSize);
-        let off = 0;
-        for (const p of bufParts) { out.set(p, off); off += p.byteLength; }
-        ws.send(out);
-        bufParts = []; bufSize = 0;
-    }
-
-    return {
-        // 外部主动发送 header（首‑3 秒极速响应）
-        sendHeader,
-        push(chunk) {
-            if (closed) return;
-            // 若不需要合帧，直接发送（最小延迟）
-            if (coalesceMs === 0 || maxBytes === 0) {
-                if (!headerSent) sendHeader();
-                ws.send(chunk);
-                return;
+            } catch (proxyErr) {
+                console.error('Proxy connection error:', proxyErr);
+                safeCloseWebSocket(ws);
             }
-            // 需要合帧：累计
-            const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-            bufParts.push(u8);
-            bufSize += u8.byteLength;
-            if (bufSize >= maxBytes) flush();
-            else scheduleFlush();
-        },
-        flush() { flush(); },
-        close() { closed = true; if (timer) clearTimeout(timer); }
-    };
+        } else {
+            safeCloseWebSocket(ws);
+        }
+        return;
+    }
+    
+    startReader(directSock, 'direct');
+
+    // 并发代理（媒体域名 0ms，其它域名延迟并发）
+    if (raceDelay !== null) {
+        const spawnProxy = async () => {
+            if (selected || closed) return;
+            try {
+                proxySock = connect({
+                    hostname: proxyConfig.proxyHost,
+                    port: proxyConfig.proxyPort !== null ? proxyConfig.proxyPort : port,
+                });
+                const w2 = proxySock.writable.getWriter();
+                await w2.write(initData);
+                w2.releaseLock();
+                if (SEND_HEADER_EARLY && !wsSender.headerSent && ws.readyState === WS_READY_STATE_OPEN) {
+                    wsSender.push(new Uint8Array(0));
+                }
+                startReader(proxySock, 'proxy');
+            } catch (e) {
+                console.error('Proxy spawn error:', e);
+            }
+        };
+        
+        if (raceDelay <= 0) {
+            spawnProxy();
+        } else {
+            fallbackTimer = setTimeout(spawnProxy, raceDelay);
+        }
+    }
 }
 
-// ==================== ⑪ UDP（DoH） ====================
+// ==================== ⑫ DNS（UDP）处理 – DoH（零拷贝回写） ====================
 async function handleUDPOutBound(ws, vlessHeader) {
     let headerSent = false;
-    const tr = new TransformStream({
-        transform(chunk, ctrl) {
-            // 长度字段拆分成独立 UDP 包
+
+    const transform = new TransformStream({
+        transform(chunk, controller) {
+            // 拆分长度字段为 UDP 包
             for (let i = 0; i < chunk.byteLength;) {
                 const len = new DataView(chunk.buffer, chunk.byteOffset + i, 2).getUint16(0);
                 const data = new Uint8Array(chunk.buffer, chunk.byteOffset + i + 2, len);
-                ctrl.enqueue(data);
+                controller.enqueue(data);
                 i += 2 + len;
             }
         },
     });
 
-    tr.readable.pipeTo(new WritableStream({
-        async write(dnsQuery) {
-            const r = await fetch('https://dns.google/dns-query', {
+    transform.readable.pipeTo(new WritableStream({
+        async write(dQuery) {
+            const resp = await fetch('https://dns.google/dns-query', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
-                body: dnsQuery,
+                headers: {
+                    'Content-Type': 'application/dns-message',
+                    'Accept': 'application/dns-message',
+                },
+                body: dQuery,
             });
-            const ans = await r.arrayBuffer();
+            const ans = await resp.arrayBuffer();
             const sz = ans.byteLength;
             const szBuf = new Uint8Array([(sz >> 8) & 0xff, sz & 0xff]);
 
-            if (!headerSent) { ws.send(vlessHeader); headerSent = true; }
-            ws.send(szBuf);
-            ws.send(ans);
+            if (ws.readyState === WS_READY_STATE_OPEN) {
+                if (!headerSent) { ws.send(vlessHeader); headerSent = true; }
+                // 分帧发送长度与负载，避免合并拷贝
+                ws.send(szBuf);
+                ws.send(ans);
+            }
         },
-    })).catch(() => { /* internal ignore */ });
+    })).catch(() => { /* 吞掉内部错误 */ });
 
-    const w = tr.writable.getWriter();
-    return { write: chunk => w.write(chunk) };
+    const writer = transform.writable.getWriter();
+    return {
+        write(chunk) {
+            writer.write(chunk);
+        },
+    };
 }
 
-// ==================== ⑫ 安全关闭 ====================
-const WS_OPEN = 1, WS_CLOSING = 2;
-function safeCloseWebSocket(ws) {
+// ==================== ⑬ 辅助：WebSocket 安全关闭 ====================
+const WS_READY_STATE_OPEN = 1;
+const WS_READY_STATE_CLOSING = 2;
+function safeCloseWebSocket(sock) {
     try {
-        if (ws.readyState === WS_OPEN || ws.readyState === WS_CLOSING) ws.close();
+        if (sock.readyState === WS_READY_STATE_OPEN || sock.readyState === WS_READY_STATE_CLOSING) {
+            sock.close();
+        }
     } catch { /* ignore */ }
 }
