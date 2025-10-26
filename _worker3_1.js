@@ -123,7 +123,7 @@ function getVLESSConfig(userID, currentHost) {
 
     const params = new URLSearchParams({
         encryption: 'none', security: 'tls', sni: currentHost, fp: 'random',
-        type: 'ws', host: currentHost, path, mux: 'none', alpn: 'none',
+        type: 'ws', host: currentHost, path, mux: '1', alpn: 'h2,http/1.1',
     });
 
     const allVlessUris = preferredDomains.map((domain, idx) => {
