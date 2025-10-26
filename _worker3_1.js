@@ -7,6 +7,15 @@ let userID = '5c4eed9c-4071-4d02-a00f-4ac58221238f'; // 请自行替换
 let proxyIP = 'proxy.xxxxxxxx.tk:50001';  // 默认 proxyip 代理
 let socks5 = '';                          // 默认 SOCKS5 代理, e.g., 'user:pass@host:port' or 'host:port'
 
+// --- DNS 优化配置 ---
+const DOH_ENDPOINTS = [ // 多路 DoH 解析点，随机选择
+    'https://dns.google/dns-query',
+    'https://cloudflare-dns.com/dns-query',
+    'https://dns.adguard-dns.com/dns-query',
+];
+const DNS_CACHE_TTL = 300 * 1000; // DNS 缓存有效期 (毫秒), 300秒 = 5分钟
+const DNS_CACHE_MAX_ENTRIES = 1000; // 最大缓存条目，防止内存泄漏
+
 // --- 传输优化参数 (保留所有既有优化) ---
 const RACE_ENABLED = true;
 const GEN_RACE_DELAY_MS = 350;
@@ -123,7 +132,7 @@ function getVLESSConfig(userID, currentHost) {
 
     const params = new URLSearchParams({
         encryption: 'none', security: 'tls', sni: currentHost, fp: 'random',
-        type: 'ws', host: currentHost, path, mux: '1', alpn: 'h2,http/1.1',
+        type: 'ws', host: currentHost, path, mux: 'none', alpn: 'none',
     });
 
     const allVlessUris = preferredDomains.map((domain, idx) => {
@@ -399,15 +408,60 @@ async function socks5Connect(socket, address, port, username, password) {
 }
 
 // ==================== ⑫ DNS (UDP) 与 WebSocket 关闭辅助 ====================
-async function handleUDPOutBound(ws, vH) {
-    let hS = false;
-    const t = new TransformStream({ transform(c, k) { for (let i = 0; i < c.byteLength;) { const l = new DataView(c.buffer, c.byteOffset + i, 2).getUint16(0); k.enqueue(new Uint8Array(c.buffer, c.byteOffset + i + 2, l)); i += 2 + l; } } });
-    t.readable.pipeTo(new WritableStream({ async write(q) {
-        const r = await fetch('https://dns.google/dns-query', { method: 'POST', headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' }, body: q });
-        const a = await r.arrayBuffer(), s = a.byteLength, sB = new Uint8Array([(s >> 8) & 0xff, s & 0xff]);
-        if (ws.readyState === 1) { if (!hS) { ws.send(vH); hS = true; } ws.send(sB); ws.send(a); }
-    }})).catch(() => {});
-    return { write(c) { t.writable.getWriter().write(c) } };
+const dnsCache = new Map();
+function getRandomDohEndpoint() {
+    return DOH_ENDPOINTS[Math.floor(Math.random() * DOH_ENDPOINTS.length)];
 }
+
+async function handleUDPOutBound(ws, vlessHeader) {
+    let headerSent = false;
+    // 清理过大缓存
+    if (dnsCache.size > DNS_CACHE_MAX_ENTRIES) dnsCache.clear();
+
+    const transform = new TransformStream({
+        transform(chunk, controller) {
+            for (let i = 0; i < chunk.byteLength;) {
+                const len = new DataView(chunk.buffer, chunk.byteOffset + i, 2).getUint16(0);
+                const data = new Uint8Array(chunk.buffer, chunk.byteOffset + i + 2, len);
+                controller.enqueue(data);
+                i += 2 + len;
+            }
+        }
+    });
+
+    transform.readable.pipeTo(new WritableStream({
+        async write(dQuery) {
+            const cacheKey = btoa(String.fromCharCode.apply(null, dQuery));
+            const cached = dnsCache.get(cacheKey);
+
+            let answer;
+            if (cached && Date.now() < cached.expiry) {
+                answer = cached.answer;
+            } else {
+                const resp = await fetch(getRandomDohEndpoint(), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
+                    body: dQuery,
+                });
+                if (resp.ok) {
+                    answer = await resp.arrayBuffer();
+                    dnsCache.set(cacheKey, { answer, expiry: Date.now() + DNS_CACHE_TTL });
+                }
+            }
+
+            if (answer && ws.readyState === 1) {
+                const size = answer.byteLength;
+                const sizeBuf = new Uint8Array([(size >> 8) & 0xff, size & 0xff]);
+                if (!headerSent) { ws.send(vlessHeader); headerSent = true; }
+                ws.send(sizeBuf);
+                ws.send(answer);
+            }
+        }
+    })).catch(() => {});
+
+    const writer = transform.writable.getWriter();
+    return { write: (chunk) => writer.write(chunk) };
+}
+
 const WS_READY_STATE_OPEN = 1, WS_READY_STATE_CLOSING = 2;
 function safeCloseWebSocket(s) { try { if (s.readyState === WS_READY_STATE_OPEN || s.readyState === WS_READY_STATE_CLOSING) s.close(); } catch {} }
