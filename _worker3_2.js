@@ -76,7 +76,7 @@ function parseProxyIP(proxyStr) {
 function parseSocks5(socks5Str) {
     if (!socks5Str) return null;
     // Regex to handle user:pass@host:port, with optional user:pass and IPv6 brackets
-    const match = socks5Str.match(/^(?:([^:@]+):([^@]+)@)?(\[[^\]]+\]|[^:]+?):(\d+)$/);
+    const match = socks5Str.match(/(?:([^:@]+):([^@]+)@)?(\[[^\]]+\]|[^:]+):(\d+)/);
     if (!match) return null;
     const [, username = '', password = '', host, portStr] = match;
     const port = parseInt(portStr, 10);
