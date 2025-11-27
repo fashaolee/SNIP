@@ -1,7 +1,7 @@
 import { connect } from 'cloudflare:sockets';
 
 // ==================== ① 基础配置 ====================
-let userID = '5c4eed9c-4071-4d02-a00f-4ac58221238f'; // 请自行替换
+let userID = ''; // 请自行替换
 
 // --- 代理配置 (proxyip 和 socks5 只能二选一，优先级: path > query > 默认) ---
 let proxyIP = 'proxy.xxxxxxxx.tk:50001';  // 默认 proxyip 代理
