@@ -45,7 +45,7 @@ const FLOW_CONTROL_DELAY_STEPS = [
 // --- 其它配置 ---
 const preferredDomains = [
     'store.ubi.com', 'ip.sb', 'mfa.gov.ua', 'www.shopify.com', 'cf.cloudflare.182682.xyz',
-    'cf.tencentapp.cn', 'staticdelivery.nexusmods.com', 'bestcf.top',
+    'cf.tencentapp.cn', 'staticdelivery.nexusmods.com', 'bestcf.top', 'www.wto.org',
     'cf.090227.xyz', 'cf.zhetengsha.eu.org', 'baipiao.cmliussss.abrdns.com', 'saas.sin.fan',
 ];
 const TEXT_ENCODER = new TextEncoder();
